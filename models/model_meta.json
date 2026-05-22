@@ -1,0 +1,33 @@
+{
+  "feature_cols": [
+    "decel_magnitude",
+    "baseline_velocity_sw",
+    "current_velocity_sw",
+    "arm_extension_ratio",
+    "hand_enc",
+    "is_ghost_frame",
+    "velocity_drop",
+    "velocity_ratio",
+    "extension_x_decel"
+  ],
+  "n_train": 48,
+  "n_test": 12,
+  "accuracy": 0.9167,
+  "roc_auc": 0.9062,
+  "cv_f1": "0.763 \u00b1 0.203",
+  "class_balance": {
+    "real_strikes": 21,
+    "false_positives": 39
+  },
+  "importances": {
+    "velocity_ratio": 0.3482,
+    "decel_magnitude": 0.3421,
+    "current_velocity_sw": 0.0987,
+    "baseline_velocity_sw": 0.0718,
+    "velocity_drop": 0.0588,
+    "arm_extension_ratio": 0.0398,
+    "extension_x_decel": 0.0388,
+    "hand_enc": 0.002,
+    "is_ghost_frame": 0.0
+  }
+}

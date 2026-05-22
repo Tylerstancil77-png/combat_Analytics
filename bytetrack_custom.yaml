@@ -1,0 +1,20 @@
+tracker_type: bytetrack
+
+# Lower than default (0.5) so ByteTrack creates tracks for all
+# detections that pass our YOLO_CONF threshold (0.40)
+track_high_thresh: 0.40
+
+# Second-stage match — low-conf detections used to recover lost tracks
+track_low_thresh: 0.10
+
+# Minimum conf to start a brand-new track
+new_track_thresh: 0.40
+
+# Frames a track is kept alive with no detection before being dropped.
+# Matches MAX_GHOST_FRAMES so ByteTrack and our Kalman ghost stay in sync.
+track_buffer: 5
+
+# Max IoU distance for Hungarian assignment
+match_thresh: 0.80
+
+fuse_score: True

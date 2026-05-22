@@ -1,0 +1,38 @@
+============================================================
+  Strike Classifier — Training Report
+============================================================
+  Samples       : 60 (21 real, 39 false positive)
+  Train / Test  : 48 / 12
+  Accuracy      : 0.917
+  ROC-AUC       : 0.906
+  CV F1 (5-fold): 0.763 ± 0.203
+
+  Classification Report
+  --------------------------------------------
+                  precision    recall  f1-score   support
+  
+  False Positive       1.00      0.88      0.93         8
+     Real Strike       0.80      1.00      0.89         4
+  
+        accuracy                           0.92        12
+       macro avg       0.90      0.94      0.91        12
+    weighted avg       0.93      0.92      0.92        12
+
+  Confusion Matrix  (rows=actual, cols=predicted)
+               FP    Strike
+  FP actual  [    7       1 ]
+  Strike act [    0       4 ]
+
+  Feature Importances
+  --------------------------------------------
+  velocity_ratio            0.3482  █████████████
+  decel_magnitude           0.3421  █████████████
+  current_velocity_sw       0.0987  ███
+  baseline_velocity_sw      0.0718  ██
+  velocity_drop             0.0588  ██
+  arm_extension_ratio       0.0398  █
+  extension_x_decel         0.0388  █
+  hand_enc                  0.0020  
+  is_ghost_frame            0.0000  
+
+============================================================

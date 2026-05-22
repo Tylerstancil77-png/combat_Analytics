@@ -1,0 +1,26 @@
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ── Virtual environment ───────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Large data & generated artifacts (not source) ─────────────────────────
+input_videos/
+output_data/
+output_videos/
+
+# ── Model weights (re-downloadable / large binaries) ──────────────────────
+*.pt
+*.onnx
+*.engine
+
+# ── OS / editor junk ──────────────────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/
