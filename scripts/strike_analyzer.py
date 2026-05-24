@@ -97,6 +97,10 @@ SKELETON_EDGES = [
 DEFAULT_MODEL        = "yolo11n-pose.pt"
 YOLO_CONF            = 0.40
 YOLO_IOU             = 0.45
+YOLO_IMGSZ           = 640    # inference resolution.  Tried 1280 — it INCREASED
+                              # track churn (more bystanders detected → more
+                              # identity competition) without reducing frame loss,
+                              # so reverted.  Detection res was not the bottleneck.
 
 KP_CONF_THRESHOLD       = 0.50   # skeleton keypoints (shoulders, hips, knees)
 WRIST_KP_CONF_THRESHOLD = 0.30   # wrist keypoints only — YOLO scores boxing gloves
@@ -183,14 +187,33 @@ SUBFRAME_STEPS         = 4    # virtual KF predict steps per real video frame
 # ── Re-identification thresholds ──────────────────────────────────────────────
 REID_MIN_SIM        = 0.55   # min colour correlation to accept a Re-ID candidate
                              # (raised from 0.35 — rejects corner staff in similar colours)
-REID_MAX_DISTANCE   = 250    # px — candidate bbox centre must be within this of last known position
-REID_MIN_TRACK_AGE  = 3      # consecutive frames a track must exist before Re-ID will accept it
-                             # — a coach who just walked into frame always has age=1 and is ignored
+REID_MAX_DISTANCE   = 450    # px — candidate bbox centre must be within this of last known
+                             # position.  250 was too tight on 2880-wide footage: a fighter
+                             # who moved during the gap fell out of range and stayed "lost".
+REID_MIN_TRACK_AGE  = 1      # consecutive frames a track must exist before Re-ID will accept it.
+                             # Was 3 (to dodge a coach mis-ID) but that GUARANTEED ≥3 lost
+                             # frames per ID churn — the dominant cause of frame loss.  The
+                             # colour-similarity gate (REID_MIN_SIM) is the real non-fighter
+                             # guard, so age can drop to 1 and re-attach immediately.
 REID_COOLDOWN_FRAMES = 8     # frames the guardrail stays silent after any Re-ID fires
                              # — prevents a correct Re-ID from being immediately undone
 GUARDRAIL_MIN_MATCH = 0.30   # both bbox→profile scores must exceed this before a swap is allowed
                              # — a non-fighter scoring 0.08 against either profile can't drive a swap
 BOTH_LOST_RESET     = MAX_GHOST_FRAMES * 2   # frames before both-lost triggers a full re-lock
+
+# ── Per-frame identity assignment ─────────────────────────────────────────────
+# Once colour profiles exist, identity is decided EVERY frame by assigning the
+# two best-matching trackable bodies to Fighter A / B — there is no "reject a
+# present fighter" gate (that gate was the dominant cause of frame loss).  Each
+# candidate is scored by colour similarity to the profile plus proximity to the
+# fighter's last position; a 2-way assignment maximises total score.
+ASSIGN_W_COLOR      = 1.0    # weight on colour-profile correlation  (range −1..1)
+ASSIGN_W_PROX       = 0.5    # weight on proximity-to-last-position   (range  0..1)
+ASSIGN_PROX_NORM_SW = 6.0    # proximity decays to 0 at this many shoulder-widths
+ASSIGN_FLOOR        = 0.15   # min score to claim a candidate (else fighter = lost).
+                             # Low on purpose: we pick the BEST body, only refusing
+                             # an obvious non-fighter when the real one is absent.
+ASSIGN_ADAPT_MIN_SIM = 0.35  # only blend a profile toward an assignment this good
 
 # ── Strike debounce ───────────────────────────────────────────────────────────
 # The deceleration trigger fires on every frame of a punch's follow-through,
@@ -272,6 +295,24 @@ WRIST_STEP_MAX_FRAMES  = 5      # cap the elapsed-frame scaling so a long gap
 # ~0.40 sw/frame.  Any "strike" whose baseline velocity exceeds this ceiling is
 # a tracking glitch, not a punch — drop it.  0.70 sw/f ≈ 19 m/s leaves margin.
 MAX_STRIKE_VEL_SW      = 0.70
+
+# ── Color glove refinement ────────────────────────────────────────────────────
+# Pose keypoints sit at the anatomical WRIST, behind the glove, and YOLO drops
+# them in exactly the fast/occluded moments that matter.  Boxing gloves, by
+# contrast, are large vividly-coloured objects.  We learn each fighter's glove
+# colour from confident early detections, then every frame use the pose estimate
+# as a SEED and snap the dot to the actual glove blob (HSV back-projection) in a
+# small window around the seed.  This lands the dot on the glove face, fixes the
+# wrist offset, and corrects fallback drift.  If no plausible blob is found it
+# keeps the pose estimate, so refinement can only help.
+GLOVE_MODEL_FRAMES        = 12     # confident detections used to build the model
+GLOVE_MODEL_SAMPLE_SW     = 0.20   # tight ROI radius for colour sampling (× sw)
+GLOVE_REFINE_RADIUS_SW    = 0.45   # search-window radius around the pose seed (× sw)
+GLOVE_BACKPROJ_THRESH     = 60     # 0–255 back-projection probability threshold
+GLOVE_MIN_BLOB_SW         = 0.10   # min blob size (× sw); area gate = (this·sw)²
+GLOVE_MODEL_MIN_SAT       = 40     # mean saturation below which colour is too
+                                   # unreliable (white/grey gloves) — refine off
+GLOVE_REFINE_MAX_SHIFT_SW = 0.45   # refined point may not move more than this (× sw)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -579,6 +620,14 @@ class Fighter:
         self.velocity_log:     List[float]   = []   # baseline velocity in sw/frame
         self.velocity_log_ms:  List[float]   = []   # baseline velocity in m/s
 
+        # ── Color glove refinement ────────────────────────────────────────────
+        # HS histogram (scaled 0–255 for cv2.calcBackProject) of this fighter's
+        # gloves, learned from the first confident detections.  Shared by both
+        # hands (a fighter's gloves are the same colour).
+        self.glove_color_model: Optional[np.ndarray] = None
+        self.glove_model_accum: List[np.ndarray]     = []   # samples while building
+        self.glove_model_sat:   float                = 0.0  # mean saturation of model
+
         # ── Anatomical-chain caches ───────────────────────────────────────────
         # Forearm length (elbow→wrist) measured live per side; drives the
         # forearm-reach constraint.  None until the first clean measurement.
@@ -594,6 +643,7 @@ class Fighter:
         self.reject_ownership:   Dict[str, int] = {"Left": 0, "Right": 0}  # closer to other elbow (glue/swap)
         self.reject_step:        Dict[str, int] = {"Left": 0, "Right": 0}  # teleported from last real detection
         self.fallback_kinematic: Dict[str, int] = {"Left": 0, "Right": 0}  # elbow-projected (YOLO dropped wrist)
+        self.glove_refined:      Dict[str, int] = {"Left": 0, "Right": 0}  # snapped to glove blob via colour
         self.reject_decel:       Dict[str, int] = {"Left": 0, "Right": 0}
         self.reject_extension:   Dict[str, int] = {"Left": 0, "Right": 0}
         self.reject_direction:   Dict[str, int] = {"Left": 0, "Right": 0}
@@ -629,7 +679,8 @@ class Fighter:
             f"  reject_forearm={self.reject_forearm['Left']}/{self.reject_forearm['Right']}"
             f"  reject_ownership={self.reject_ownership['Left']}/{self.reject_ownership['Right']}"
             f"  reject_step={self.reject_step['Left']}/{self.reject_step['Right']}"
-            f"  kinematic_fallback={self.fallback_kinematic['Left']}/{self.fallback_kinematic['Right']}",
+            f"  kinematic_fallback={self.fallback_kinematic['Left']}/{self.fallback_kinematic['Right']}"
+            f"  glove_refined={self.glove_refined['Left']}/{self.glove_refined['Right']}",
             f"    Strike-gate rejects (L / R):"
             f"  decel={self.reject_decel['Left']}/{self.reject_decel['Right']}"
             f"  ext={self.reject_extension['Left']}/{self.reject_extension['Right']}"
@@ -744,6 +795,7 @@ def _estimate_wrist_measurements(
     kps:     np.ndarray,
     conf:    np.ndarray,
     fighter: "Fighter",
+    frame:   Optional[np.ndarray] = None,
 ) -> Dict[str, WristMeas]:
     """
     Jointly estimate both wrist measurements using the arm kinematic chain.
@@ -792,6 +844,39 @@ def _estimate_wrist_measurements(
 
     out: Dict[str, WristMeas] = {s: WristMeas() for s in sides}
 
+    # ── Color glove refinement setup ──────────────────────────────────────────
+    sample_r    = int(np.clip(GLOVE_MODEL_SAMPLE_SW  * sw, 12, 60))
+    refine_r    = int(np.clip(GLOVE_REFINE_RADIUS_SW * sw, 20, 140))
+    min_blob    = (GLOVE_MIN_BLOB_SW * sw) ** 2
+    max_shift   = GLOVE_REFINE_MAX_SHIFT_SW * sw
+    model_ready = (fighter.glove_color_model is not None
+                   and fighter.glove_model_sat >= GLOVE_MODEL_MIN_SAT)
+
+    def _finalize_pos(side: str, w: np.ndarray) -> np.ndarray:
+        """Build the colour model from confident frames, then snap to the glove."""
+        if frame is None:
+            return w
+        if fighter.glove_color_model is None:
+            samp = _glove_color_sample(frame, w, sample_r)
+            if samp is not None:
+                fighter.glove_model_accum.append(samp)
+                if len(fighter.glove_model_accum) >= GLOVE_MODEL_FRAMES:
+                    hists = np.mean([h for h, _ in fighter.glove_model_accum],
+                                    axis=0).astype(np.float32)
+                    cv2.normalize(hists, hists, 0, 255, cv2.NORM_MINMAX)
+                    fighter.glove_color_model = hists
+                    fighter.glove_model_sat   = float(
+                        np.mean([s for _, s in fighter.glove_model_accum]))
+                    fighter.glove_model_accum = []
+            return w
+        if model_ready:
+            refined = _refine_to_glove(frame, w, fighter.glove_color_model,
+                                       refine_r, min_blob, max_shift)
+            if refined is not None:
+                fighter.glove_refined[side] += 1
+                return refined
+        return w
+
     for s in sides:
         state     = fighter.hands[s]
         state.frames_since_yolo += 1            # reset to 0 if a real wrist lands
@@ -819,10 +904,13 @@ def _estimate_wrist_measurements(
                     own_ok = False
                     fighter.reject_step[s] += 1
                 if own_ok:
-                    out[s] = WristMeas(w.copy(), wrist_conf[s], "yolo")
-                    accepted = True
+                    # Step gate references the pose WRIST (consistent frame to
+                    # frame); the OUTPUT is snapped to the glove face.
                     state.last_yolo_pos     = w.copy()
                     state.frames_since_yolo = 0
+                    pos = _finalize_pos(s, w)
+                    out[s] = WristMeas(pos, wrist_conf[s], "yolo")
+                    accepted = True
             else:
                 fighter.reject_forearm[s] += 1
 
@@ -830,20 +918,26 @@ def _estimate_wrist_measurements(
             # No elbow to validate against — accept (down-weighted) only if the
             # move from the last real detection is physically plausible.
             if _wrist_step_ok(state, w, sw):
-                out[s] = WristMeas(w.copy(), wrist_conf[s] * NO_ELBOW_CONF_SCALE, "yolo")
-                accepted = True
                 state.last_yolo_pos     = w.copy()
                 state.frames_since_yolo = 0
+                pos = _finalize_pos(s, w)
+                out[s] = WristMeas(pos, wrist_conf[s] * NO_ELBOW_CONF_SCALE, "yolo")
+                accepted = True
             else:
                 fighter.reject_step[s] += 1
 
         # ── Kinematic fallback: elbow visible, no usable wrist keypoint ───────
+        # Use the last CORRECTED glove position (current_xy), NOT the velocity-
+        # extrapolated prediction.  Extrapolating forward made the dot overshoot
+        # into empty space after a punch (the "dot in the torso" artifact) — when
+        # we're blind, the safest estimate is "the glove is near where it last
+        # was", clamped to the forearm circle around the current elbow.
         if not accepted and e is not None:
-            pred = state.kf.predicted_xy
-            if pred is not None:
-                v = pred - e
+            last = state.kf.current_xy
+            if last is not None:
+                v = last - e
                 d = float(np.linalg.norm(v))
-                proj = e + (v / d) * min(d, max_reach) if d > 1e-3 else pred
+                proj = e + (v / d) * min(d, max_reach) if d > 1e-3 else last
                 out[s] = WristMeas(proj, KINEMATIC_FALLBACK_CONF, "kinematic")
                 fighter.fallback_kinematic[s] += 1
 
@@ -907,6 +1001,92 @@ def _has_valid_skeleton(kps: np.ndarray, conf: np.ndarray) -> bool:
     return required_ok and lower_ok
 
 
+def _is_trackable_fighter(kps: np.ndarray, conf: np.ndarray) -> bool:
+    """
+    RELAXED validity for ONGOING re-identification (not initial lock).
+
+    Once we already know who the fighters are, we shouldn't demand a full-body
+    skeleton every frame to keep tracking them — in close footage the legs are
+    routinely cropped by the frame or hidden behind the opponent/ropes, yet the
+    fighter is plainly present.  This requires only:
+      • Both shoulders            (the reliable upper-body anchor)
+      • At least one hip          (torso is present, not just a floating head)
+    Identity is still protected by the colour-similarity gate at the call site;
+    this check only decides "is this a plausibly trackable body", not "who".
+    """
+    shoulders_ok = (float(conf[KP_LEFT_SHOULDER])  >= KP_CONF_THRESHOLD and
+                    float(conf[KP_RIGHT_SHOULDER]) >= KP_CONF_THRESHOLD)
+    hip_ok       = (float(conf[KP_LEFT_HIP])  >= KP_CONF_THRESHOLD or
+                    float(conf[KP_RIGHT_HIP]) >= KP_CONF_THRESHOLD)
+    return shoulders_ok and hip_ok
+
+
+def _assign_fighters_by_appearance(
+    fighters:       List["Fighter"],
+    track_ids_arr:  np.ndarray,
+    kps_all:        np.ndarray,
+    conf_all:       np.ndarray,
+    xyxy_all:       np.ndarray,
+    color_profiles: Dict[int, Optional[np.ndarray]],
+    frame:          np.ndarray,
+) -> Dict[int, Optional[int]]:
+    """
+    Decide which detection IS each fighter THIS frame — no ID persistence, no
+    reject-the-present-fighter gate.  Every trackable body is scored against
+    each fighter by colour similarity + proximity to that fighter's last known
+    position, and the highest-scoring 2-way assignment wins.
+
+    Returns {0: det_index|None, 1: det_index|None}.  A fighter is None only when
+    no candidate clears ASSIGN_FLOOR (i.e. genuinely absent), not because a gate
+    rejected a present body.
+    """
+    out: Dict[int, Optional[int]] = {0: None, 1: None}
+    cands = [i for i in range(len(track_ids_arr))
+             if _is_trackable_fighter(kps_all[i], conf_all[i])]
+    if not cands or color_profiles[0] is None or color_profiles[1] is None:
+        return out
+
+    # Precompute appearance + centre for each candidate.
+    hist_of:   Dict[int, np.ndarray] = {}
+    centre_of: Dict[int, np.ndarray] = {}
+    for i in cands:
+        hist_of[i]   = _extract_hist(frame, xyxy_all[i])
+        bx           = xyxy_all[i]
+        centre_of[i] = np.array([(bx[0] + bx[2]) / 2.0, (bx[1] + bx[3]) / 2.0])
+
+    def score(fi: int, i: int) -> float:
+        cs = float(cv2.compareHist(hist_of[i], color_profiles[fi], cv2.HISTCMP_CORREL))
+        prox = 0.0
+        lb = fighters[fi].cached_bbox
+        if lb is not None:
+            last_c = np.array([(lb[0] + lb[2]) / 2.0, (lb[1] + lb[3]) / 2.0])
+            sw     = max(fighters[fi].cached_sw, 1.0)
+            d      = float(np.linalg.norm(centre_of[i] - last_c))
+            prox   = max(0.0, 1.0 - d / (ASSIGN_PROX_NORM_SW * sw))
+        return ASSIGN_W_COLOR * cs + ASSIGN_W_PROX * prox
+
+    sA = {i: score(0, i) for i in cands}
+    sB = {i: score(1, i) for i in cands}
+
+    # Best 2-way assignment (either fighter may be None if no body clears floor).
+    best_tot, best_a, best_b = -1e9, None, None
+    opts = cands + [None]
+    for a in opts:
+        if a is not None and sA[a] < ASSIGN_FLOOR:
+            continue
+        for b in opts:
+            if a is not None and b is not None and a == b:
+                continue
+            if b is not None and sB[b] < ASSIGN_FLOOR:
+                continue
+            tot = (sA[a] if a is not None else 0.0) + (sB[b] if b is not None else 0.0)
+            if tot > best_tot:
+                best_tot, best_a, best_b = tot, a, b
+
+    out[0], out[1] = best_a, best_b
+    return out
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Color histogram helpers
 # ══════════════════════════════════════════════════════════════════════════════
@@ -965,6 +1145,90 @@ def _extract_glove_hist(
     )
     cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
     return hist
+
+
+def _glove_color_sample(
+    frame:  np.ndarray,
+    center: np.ndarray,
+    radius: int,
+) -> Optional[Tuple[np.ndarray, float]]:
+    """
+    Sample a tight ROI around a confident wrist for building the glove colour
+    model.  Returns (L1-normalised HS histogram, mean saturation) or None.
+    """
+    fh, fw = frame.shape[:2]
+    cx, cy = int(round(center[0])), int(round(center[1]))
+    x1, y1 = max(0, cx - radius), max(0, cy - radius)
+    x2, y2 = min(fw, cx + radius), min(fh, cy + radius)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+    hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None,
+                        [COLOR_HIST_H_BINS, COLOR_HIST_S_BINS],
+                        [0, 180, 0, 256])
+    cv2.normalize(hist, hist, alpha=1.0, norm_type=cv2.NORM_L1)
+    mean_sat = float(hsv[:, :, 1].mean())
+    return hist.astype(np.float32), mean_sat
+
+
+def _refine_to_glove(
+    frame:    np.ndarray,
+    seed:     np.ndarray,
+    model:    np.ndarray,
+    radius:   int,
+    min_area: float,
+    max_shift: float,
+) -> Optional[np.ndarray]:
+    """
+    Snap a pose-based wrist seed onto the actual glove using HSV back-projection.
+
+    Searches a window of the given radius around `seed`, back-projects against the
+    fighter's glove colour `model`, thresholds + cleans the probability map, and
+    returns the centroid of the glove-coloured blob nearest the seed (area-gated).
+    Returns None when no plausible blob is found or it would move the point more
+    than `max_shift` px — in which case the caller keeps the pose estimate.
+    """
+    fh, fw = frame.shape[:2]
+    cx, cy = int(round(seed[0])), int(round(seed[1]))
+    x1, y1 = max(0, cx - radius), max(0, cy - radius)
+    x2, y2 = min(fw, cx + radius), min(fh, cy + radius)
+    if x2 - x1 < 6 or y2 - y1 < 6:
+        return None
+
+    roi = frame[y1:y2, x1:x2]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    bp  = cv2.calcBackProject([hsv], [0, 1], model, [0, 180, 0, 256], scale=1)
+    cv2.GaussianBlur(bp, (5, 5), 0, dst=bp)
+    _, mask = cv2.threshold(bp, GLOVE_BACKPROJ_THRESH, 255, cv2.THRESH_BINARY)
+    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kern)
+
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+
+    seed_lx, seed_ly = cx - x1, cy - y1
+    best_xy, best_d = None, float("inf")
+    for c in cnts:
+        if cv2.contourArea(c) < min_area:
+            continue
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        bxx, byy = M["m10"] / M["m00"], M["m01"] / M["m00"]
+        d = math.hypot(bxx - seed_lx, byy - seed_ly)
+        if d < best_d:
+            best_d, best_xy = d, (bxx + x1, byy + y1)
+
+    if best_xy is None:
+        return None
+    refined = np.array(best_xy, dtype=np.float64)
+    if float(np.linalg.norm(refined - seed)) > max_shift:
+        return None
+    return refined
 
 
 def _bbox_iou(box1: np.ndarray, box2: np.ndarray) -> float:
@@ -1245,6 +1509,17 @@ def analyze_video(
     # assignment isn't immediately undone by one noisy histogram comparison.
     reid_cooldown: int = 0
 
+    # ── Track-stability instrumentation ───────────────────────────────────────
+    # Quantify how badly ByteTrack churns IDs / loses fighters, so config
+    # changes can be measured rather than guessed at.
+    all_track_ids_seen: set        = set()
+    frames_visible:     Dict[int, int] = {0: 0, 1: 0}
+    frames_lost:        Dict[int, int] = {0: 0, 1: 0}
+    # Of the lost frames, how many had an unmatched valid-skeleton person on
+    # screen (→ our identity/Re-ID logic failed, H2) vs none at all (→ genuine
+    # detection failure, H1).  This decides whether to fix locking or detection.
+    lost_with_candidate: Dict[int, int] = {0: 0, 1: 0}
+
     all_events: List[dict] = []
     frame_idx = 0
 
@@ -1266,6 +1541,10 @@ def analyze_video(
             frame,
             conf=YOLO_CONF,
             iou=YOLO_IOU,
+            imgsz=YOLO_IMGSZ,        # higher inference resolution → far fewer
+                                     # dropouts on blurred/occluded fighters in
+                                     # this 2880×1800 footage (default 640 loses
+                                     # them during fast exchanges)
             tracker="bytetrack_custom.yaml",
             persist=True,
             verbose=False,
@@ -1299,6 +1578,7 @@ def analyze_video(
         # Re-ID uses this to reject brand-new tracks (age < REID_MIN_TRACK_AGE)
         # — coaches and refs who just entered frame always have age = 1.
         current_ids = set(track_ids_arr.tolist())
+        all_track_ids_seen |= current_ids          # instrumentation: ID churn
         for tid in list(track_age.keys()):
             if tid not in current_ids:
                 del track_age[tid]
@@ -1416,117 +1696,37 @@ def analyze_video(
                     f"(tight P = {KF_POS_NOISE}·I)."
                 )
 
-        # ── Build per-fighter detection lookup for this frame ─────────────────
-        # detection_for[fi] = det array index, or None if fighter not visible
+        # ── Per-fighter detection assignment ──────────────────────────────────
+        # Once colour profiles exist, identity is decided EVERY frame by
+        # appearance + motion (no ByteTrack-ID persistence, no reject gate).
+        # Before that, bootstrap from the locked ByteTrack IDs while profiles
+        # build.  `frame` is still pristine here (drawing happens later).
         detection_for: Dict[int, Optional[int]] = {0: None, 1: None}
-        for det_i, tid in enumerate(track_ids_arr):
-            if tid in locked_ids:
-                detection_for[locked_ids[tid]] = det_i
-
-        # ── Re-identification: recover fighters whose ByteTrack ID changed ──────
-        # Happens after broadcast cuts or when the tracker drops and re-creates
-        # a track with a new ID.  Uses colour histograms (once profiles exist)
-        # or falls back to a positional re-lock (left→A, right→B).
-        if fighters_locked:
-            matched_det_indices = {v for v in detection_for.values() if v is not None}
-            unmatched_tracks = [
-                (i, int(track_ids_arr[i]))
-                for i in range(len(track_ids_arr))
-                if i not in matched_det_indices
-                and int(track_ids_arr[i]) not in locked_ids
-            ]
-
+        if fighters_locked and color_ready:
+            detection_for = _assign_fighters_by_appearance(
+                fighters, track_ids_arr, kps_all, conf_all, xyxy_all,
+                color_profiles, frame,
+            )
+            # Conservatively blend each profile toward its assignment so it
+            # tracks lighting/sweat drift, but only when the match is solid.
             for fi in (0, 1):
-                if detection_for[fi] is not None or not unmatched_tracks:
-                    continue
+                di = detection_for[fi]
+                if di is not None:
+                    _h  = _extract_hist(frame, xyxy_all[di])
+                    _cs = float(cv2.compareHist(_h, color_profiles[fi], cv2.HISTCMP_CORREL))
+                    if _cs >= ASSIGN_ADAPT_MIN_SIM:
+                        color_profiles[fi] = (
+                            (1.0 - COLOR_ADAPT_RATE) * color_profiles[fi]
+                            + COLOR_ADAPT_RATE * _h
+                        ).astype(np.float32)
+        elif fighters_locked:
+            for det_i, tid in enumerate(track_ids_arr):
+                if tid in locked_ids:
+                    detection_for[locked_ids[tid]] = det_i
 
-                # Only consider tracks that pass skeleton validation —
-                # prevents a ref or corner man filling in for a lost fighter
-                skeleton_valid = [
-                    (det_i, tid) for det_i, tid in unmatched_tracks
-                    if _has_valid_skeleton(kps_all[det_i], conf_all[det_i])
-                ]
-                if not skeleton_valid:
-                    continue
-
-                # Proximity gate — candidate must be near the fighter's last
-                # known position.  Fighters don't teleport: if a track appears
-                # 300+ px from where the fighter was last seen it's almost
-                # certainly a coach, referee, or unrelated person walking past.
-                if fighters[fi].cached_bbox is not None:
-                    _lb = fighters[fi].cached_bbox
-                    _last_cx = (_lb[0] + _lb[2]) / 2.0
-                    _last_cy = (_lb[1] + _lb[3]) / 2.0
-                    skeleton_valid = [
-                        (det_i, tid) for det_i, tid in skeleton_valid
-                        if math.sqrt(
-                            ((xyxy_all[det_i][0] + xyxy_all[det_i][2]) / 2.0 - _last_cx) ** 2 +
-                            ((xyxy_all[det_i][1] + xyxy_all[det_i][3]) / 2.0 - _last_cy) ** 2
-                        ) <= REID_MAX_DISTANCE
-                    ]
-                if not skeleton_valid:
-                    continue
-
-                # Track stability gate — only consider tracks that have been
-                # visible for at least REID_MIN_TRACK_AGE consecutive frames.
-                # A person who just walked into frame (age=1) is almost certainly
-                # not a fighter whose ByteTrack ID changed — it's a corner man,
-                # referee, or passing spectator.  Real fighters whose ID was
-                # re-assigned will become eligible within a few frames.
-                skeleton_valid = [
-                    (det_i, tid) for det_i, tid in skeleton_valid
-                    if track_age.get(int(tid), 0) >= REID_MIN_TRACK_AGE
-                ]
-                if not skeleton_valid:
-                    continue
-
-                if color_ready:
-                    # Pick the skeleton-valid track whose colour best matches fi
-                    best_sim, best_det_i, best_tid = -1.0, None, None
-                    for det_i, tid in skeleton_valid:
-                        sim = cv2.compareHist(
-                            _extract_hist(frame, xyxy_all[det_i]),
-                            color_profiles[fi],
-                            cv2.HISTCMP_CORREL,
-                        )
-                        if sim > best_sim:
-                            best_sim, best_det_i, best_tid = sim, det_i, tid
-
-                    if best_sim >= REID_MIN_SIM and best_det_i is not None:
-                        old_key = next((k for k, v in locked_ids.items() if v == fi), None)
-                        if old_key is not None:
-                            del locked_ids[old_key]
-                        locked_ids[best_tid] = fi
-                        detection_for[fi]    = best_det_i
-                        unmatched_tracks = [(i, t) for i, t in unmatched_tracks
-                                            if t != best_tid]
-                        # Clear stale hand positions — the gap between the old
-                        # track and the new one would produce a fake velocity
-                        # spike on the very first frame, which could score a
-                        # false strike.
-                        for hand in fighters[fi].hands.values():
-                            hand.prev_pos = None
-                        # Silence the guardrail so it can't immediately undo
-                        # this Re-ID based on one noisy histogram comparison.
-                        reid_cooldown = REID_COOLDOWN_FRAMES
-                        print(f"  [REID]  {fighters[fi].name} → track#{best_tid}  "
-                              f"colour_sim={best_sim:.3f}  (skeleton verified)")
-                else:
-                    # No profiles yet — assign by left/right position
-                    sorted_valid = sorted(skeleton_valid,
-                                         key=lambda x: xyxy_all[x[0]][0])
-                    det_i, tid = sorted_valid[0]
-                    old_key = next((k for k, v in locked_ids.items() if v == fi), None)
-                    if old_key is not None:
-                        del locked_ids[old_key]
-                    locked_ids[tid] = fi
-                    detection_for[fi] = det_i
-                    unmatched_tracks = [(i, t) for i, t in unmatched_tracks if t != tid]
-                    for hand in fighters[fi].hands.values():
-                        hand.prev_pos = None
-                    reid_cooldown = REID_COOLDOWN_FRAMES
-                    print(f"  [REID]  {fighters[fi].name} → track#{tid}  "
-                          f"(position fallback, skeleton verified)")
+        # (Per-frame appearance assignment above replaces the old lock-and-Re-ID
+        #  scramble: every frame already claims the best-matching bodies, so
+        #  there is no separate "recover a changed ByteTrack ID" step.)
 
         # ── Full reset when both fighters are missing too long ────────────────
         # Broadcast cut or total occlusion — drop the lock so the next frame
@@ -1560,76 +1760,10 @@ def analyze_video(
                     print(f"  [COLOR]  Master profiles locked "
                           f"(averaged {COLOR_PROFILE_FRAMES} frames)")
 
-        # ── Color histogram guardrail (always-on) ────────────────────────────
-        # Runs every frame both fighters are visible and profiles are ready.
-        # Skipped during occlusion (merged bboxes give unreliable histograms)
-        # and during the Re-ID cooldown window (a fresh Re-ID shouldn't be
-        # immediately second-guessed by one noisy frame of colour data).
-        if reid_cooldown > 0:
-            reid_cooldown -= 1
-
-        if (color_ready
-                and not occlusion_active
-                and reid_cooldown == 0
-                and detection_for[0] is not None
-                and detection_for[1] is not None):
-
-            bbox0 = xyxy_all[detection_for[0]]
-            bbox1 = xyxy_all[detection_for[1]]
-            hist0 = _extract_hist(frame, bbox0)
-            hist1 = _extract_hist(frame, bbox1)
-
-            # Similarity scores: sim[i][j] = how well box-i matches profile-j
-            sim00 = cv2.compareHist(hist0, color_profiles[0], cv2.HISTCMP_CORREL)
-            sim01 = cv2.compareHist(hist0, color_profiles[1], cv2.HISTCMP_CORREL)
-            sim10 = cv2.compareHist(hist1, color_profiles[0], cv2.HISTCMP_CORREL)
-            sim11 = cv2.compareHist(hist1, color_profiles[1], cv2.HISTCMP_CORREL)
-
-            score_current = sim00 + sim11
-            score_swapped = sim01 + sim10
-
-            # Hysteresis: swapped diagonal must exceed current by GUARDRAIL_SWAP_MARGIN
-            # to prevent score noise on borderline frames from triggering a flip.
-            #
-            # Absolute minimum check: both proposed assignments must individually
-            # score ≥ GUARDRAIL_MIN_MATCH against their new profiles.  This stops
-            # a non-fighter (coach, ref) from driving a swap just because they
-            # happen to score 0.01 higher against the wrong profile — they will
-            # score very low against BOTH profiles and never cross this floor.
-            if score_swapped > score_current + GUARDRAIL_SWAP_MARGIN:
-                if sim01 >= GUARDRAIL_MIN_MATCH and sim10 >= GUARDRAIL_MIN_MATCH:
-                    for k in locked_ids:
-                        locked_ids[k] = 1 - locked_ids[k]
-
-                    detection_for = {0: None, 1: None}
-                    for det_i, tid in enumerate(track_ids_arr):
-                        if tid in locked_ids:
-                            detection_for[locked_ids[tid]] = det_i
-
-                    # Silence the guardrail for REID_COOLDOWN_FRAMES so the
-                    # very next frame can't immediately undo a correct swap.
-                    reid_cooldown = REID_COOLDOWN_FRAMES
-                    print(f"  [ID CORRECTED]  frame={frame_idx}  "
-                          f"color_score: current={score_current:.3f}  "
-                          f"swapped={score_swapped:.3f}  "
-                          f"margin={score_swapped - score_current:.3f}")
-                else:
-                    print(f"  [GUARDRAIL BLOCKED]  frame={frame_idx}  "
-                          f"swap score higher but abs check failed  "
-                          f"(sim01={sim01:.3f}  sim10={sim10:.3f} < {GUARDRAIL_MIN_MATCH})")
-
-            elif score_current > score_swapped + GUARDRAIL_SWAP_MARGIN:
-                # Assignment is clearly correct — slowly adapt the profiles
-                # toward the fighter's current appearance so they stay accurate
-                # as sweat, lighting, and corner work change how each person looks.
-                color_profiles[0] = (
-                    (1.0 - COLOR_ADAPT_RATE) * color_profiles[0]
-                    + COLOR_ADAPT_RATE * hist0
-                ).astype(np.float32)
-                color_profiles[1] = (
-                    (1.0 - COLOR_ADAPT_RATE) * color_profiles[1]
-                    + COLOR_ADAPT_RATE * hist1
-                ).astype(np.float32)
+        # (The colour guardrail is gone: per-frame appearance assignment already
+        #  re-derives the correct A/B mapping every frame, so there is nothing to
+        #  "correct" after the fact, and profile adaptation now happens inline at
+        #  assignment time.)
 
         # ══════════════════════════════════════════════════════════════════════
         # Occlusion Freeze & Separation Protocol
@@ -1700,55 +1834,41 @@ def analyze_video(
                             state.kf._kf.errorCovPost = ep.copy()
                             state.kf._ghost_frames    = 0
 
-                # ── Post-clinch ID re-assignment (geometric spatial anchor) ───
-                # Sort the two emerging detections left-to-right by x-center.
-                # Compare against the pre-clinch horizontal ordering captured
-                # PRECLINCH_ANCHOR_FRAMES ago.  If the left/right relationship
-                # has inverted, the fighters crossed during the clinch — swap.
-                # This is deterministic and requires no visual similarity model.
-                if (both_visible
-                        and preclinch_anchor[0] is not None
-                        and preclinch_anchor[1] is not None):
-                    pre_cx = {
-                        fi: (preclinch_anchor[fi][0] + preclinch_anchor[fi][2]) / 2.0
-                        for fi in (0, 1)
-                    }
-                    was_A_left = pre_cx[0] < pre_cx[1]
-                    cur_cx = {
-                        0: (xyxy_all[detection_for[0]][0] +
-                            xyxy_all[detection_for[0]][2]) / 2.0,
-                        1: (xyxy_all[detection_for[1]][0] +
-                            xyxy_all[detection_for[1]][2]) / 2.0,
-                    }
-                    is_A_left_now = cur_cx[0] < cur_cx[1]
-                    if was_A_left != is_A_left_now:
-                        for k in locked_ids:
-                            locked_ids[k] = 1 - locked_ids[k]
-                        detection_for = {0: None, 1: None}
-                        for det_i, tid in enumerate(track_ids_arr):
-                            if tid in locked_ids:
-                                detection_for[locked_ids[tid]] = det_i
-                        print(
-                            f"  [SUCCESS]  Clinch broken. Spatial anchor re-assigned IDs "
-                            f"(Fighter_A was {'left' if was_A_left else 'right'} "
-                            f"pre-clinch → swap applied)."
-                        )
-                    else:
-                        print(
-                            f"  [SUCCESS]  Clinch broken. Spatial anchor confirms "
-                            f"current assignment — no swap needed."
-                        )
-                else:
-                    print(
-                        f"  [SUCCESS]  Clinch broken. "
-                        f"(No spatial anchor data available — holding current assignment.)"
-                    )
+                # Identity through the clinch is now handled by the per-frame
+                # appearance assignment (it re-derives A/B from colour + motion
+                # every frame), so no spatial-anchor swap is needed here — we
+                # only restored the KF covariance above.
+                print(f"  [INFO]  Clinch broken (IoU {occ_iou:.2f}). KF restored; "
+                      f"identity re-derived per-frame by appearance.")
 
         # ── Per-fighter processing ────────────────────────────────────────────
         strike_events_this_frame: List[dict] = []
 
+        # Clean (un-annotated) copy for all colour work.  Fighter A's overlay is
+        # drawn onto `frame` before Fighter B is processed, so colour sampling /
+        # glove back-projection must read this pristine copy instead.
+        clean_frame = frame.copy()
+
+        # Instrumentation: how many valid-skeleton persons are on screen but NOT
+        # matched to either fighter?  If a fighter is lost while one of these
+        # exists, our identity logic failed (H2), not detection (H1).
+        _matched_idx = {detection_for[0], detection_for[1]} - {None}
+        n_unmatched_valid = sum(
+            1 for i in range(len(track_ids_arr))
+            if i not in _matched_idx and _is_trackable_fighter(kps_all[i], conf_all[i])
+        )
+
         for fi, fighter in enumerate(fighters):
             det_idx = detection_for[fi]
+
+            # Instrumentation: once locked, is this fighter visible this frame?
+            if fighters_locked:
+                if det_idx is None:
+                    frames_lost[fi] += 1
+                    if n_unmatched_valid > 0:
+                        lost_with_candidate[fi] += 1
+                else:
+                    frames_visible[fi] += 1
 
             kps  = kps_all[det_idx]  if det_idx is not None else None
             conf = conf_all[det_idx] if det_idx is not None else None
@@ -1810,7 +1930,7 @@ def analyze_video(
             # both elbows) BEFORE the per-hand loop.  Skipped during occlusion,
             # when merged bboxes make every keypoint unreliable.
             if not occlusion_active and kps is not None and conf is not None:
-                wrist_meas = _estimate_wrist_measurements(kps, conf, fighter)
+                wrist_meas = _estimate_wrist_measurements(kps, conf, fighter, clean_frame)
             else:
                 wrist_meas = {"Left": WristMeas(), "Right": WristMeas()}
 
@@ -1847,7 +1967,7 @@ def analyze_video(
                 # now — the anatomical constraints own acceptance.  We still
                 # maintain the fingerprint so the overlay can show a live score.
                 if raw is not None:
-                    cand = _extract_glove_hist(frame, raw)
+                    cand = _extract_glove_hist(clean_frame, raw)
                     if cand is not None:
                         if state.glove_hist is None:
                             state.glove_hist  = cand.copy()
@@ -2046,6 +2166,21 @@ def analyze_video(
     for f in fighters:
         print(f.summary())
     print(f"  Total strikes: {len(all_events)}")
+
+    # ── Track-stability report ────────────────────────────────────────────────
+    print(f"\n  ── Track stability ──")
+    print(f"  Distinct ByteTrack IDs used (lower = less churn): {len(all_track_ids_seen)}")
+    for fi in (0, 1):
+        tot = frames_visible[fi] + frames_lost[fi]
+        pct = 100.0 * frames_lost[fi] / max(1, tot)
+        cand = lost_with_candidate[fi]
+        cand_pct = 100.0 * cand / max(1, frames_lost[fi])
+        print(f"    {fighters[fi].name}: visible {frames_visible[fi]}  "
+              f"lost {frames_lost[fi]}  ({pct:.1f}% of locked frames lost)")
+        print(f"        of those lost frames, {cand} ({cand_pct:.1f}%) had an "
+              f"unmatched fighter-shaped person on screen → identity-logic gap (H2)")
+        print(f"        the remaining {frames_lost[fi]-cand} were genuine "
+              f"detection failures (H1)")
 
     df = pd.DataFrame(all_events, columns=[
         "timestamp_s", "fighter", "hand", "decel_magnitude",

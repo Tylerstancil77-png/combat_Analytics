@@ -10,9 +10,14 @@ track_low_thresh: 0.10
 # Minimum conf to start a brand-new track
 new_track_thresh: 0.40
 
-# Frames a track is kept alive with no detection before being dropped.
-# Matches MAX_GHOST_FRAMES so ByteTrack and our Kalman ghost stay in sync.
-track_buffer: 5
+# Frames a track is kept alive (in "lost" state) with no detection before it is
+# discarded.  This is INDEPENDENT of our Kalman ghost window — it governs whether
+# ByteTrack re-associates a reappearing fighter to the SAME id or spawns a new
+# one.  At 5 frames (~0.08 s) any clinch or motion-blur gap dropped the fighter
+# and re-created it with a fresh id (253 distinct ids in a 2-fighter clip!).
+# 30 frames (~0.5 s) — a sane default, well above the original 5.  (60 was
+# tried; re-attachment still didn't happen, so the limit is elsewhere.)
+track_buffer: 30
 
 # Max IoU distance for Hungarian assignment
 match_thresh: 0.80
