@@ -311,8 +311,15 @@ MAX_STRIKE_VEL_SW      = 0.70
 GLOVE_MODEL_FRAMES        = 12     # confident detections used to build the model
 GLOVE_MODEL_SAMPLE_SW     = 0.20   # tight ROI radius for colour sampling (× sw)
 GLOVE_REFINE_RADIUS_SW    = 0.45   # search-window radius around the pose seed (× sw)
-GLOVE_BACKPROJ_THRESH     = 60     # 0–255 back-projection probability threshold
-GLOVE_MIN_BLOB_SW         = 0.10   # min blob size (× sw); area gate = (this·sw)²
+GLOVE_BACKPROJ_THRESH     = 40     # 0–255 back-projection probability threshold.
+                                   # Lowered from 60: Fighter B's (bare-torso)
+                                   # glove model back-projects weakly, so 60 left
+                                   # no contour ~700×/hand. 40 recovers those weak
+                                   # but real glove pixels; skin doesn't match a
+                                   # glove-coloured model so it stays dark anyway.
+GLOVE_MIN_BLOB_SW         = 0.07   # min blob size (× sw); area gate = (this·sw)².
+                                   # Lowered from 0.10 — weak back-projections form
+                                   # smaller-but-valid glove blobs.
 GLOVE_MODEL_MIN_SAT       = 40     # mean saturation below which colour is too
                                    # unreliable (white/grey gloves) — refine off
 GLOVE_REFINE_MAX_SHIFT_SW = 0.45   # refined point may not move more than this (× sw)
@@ -662,6 +669,8 @@ class Fighter:
         self.dot_at_wrist: Dict[str, int] = {"Left": 0, "Right": 0}
         self.dot_fallback: Dict[str, int] = {"Left": 0, "Right": 0}
         self.dot_ghost:    Dict[str, int] = {"Left": 0, "Right": 0}
+        # Why glove refinement failed when it did (diagnostic for at-wrist dots).
+        self.refine_reason: Dict[str, Dict[str, int]] = {"Left": {}, "Right": {}}
 
         self.cached_torso: Optional[np.ndarray] = None
         self.cached_sw:    float                = 150.0
@@ -712,6 +721,11 @@ class Fighter:
                 f"at-wrist {100*w/tot:4.1f}%  fallback {100*f/tot:4.1f}%  "
                 f"ghost {100*gh/tot:4.1f}%   (n={g+w+f+gh})"
             )
+        for side in ("Left", "Right"):
+            rr = self.refine_reason[side]
+            if rr:
+                parts = "  ".join(f"{k}={v}" for k, v in sorted(rr.items()))
+                lines.append(f"    {side:5s} refine: {parts}")
         return "\n".join(lines)
 
 
@@ -900,8 +914,10 @@ def _estimate_wrist_measurements(
                     fighter.glove_model_accum = []
             return w, False
         if model_ready:
-            refined = _refine_to_glove(frame, w, fighter.glove_color_model,
-                                       refine_r, min_blob, max_shift)
+            refined, reason = _refine_to_glove(frame, w, fighter.glove_color_model,
+                                               refine_r, min_blob, max_shift)
+            fighter.refine_reason[side][reason] = (
+                fighter.refine_reason[side].get(reason, 0) + 1)
             if refined is not None:
                 fighter.glove_refined[side] += 1
                 return refined, True
@@ -1212,22 +1228,25 @@ def _refine_to_glove(
     radius:   int,
     min_area: float,
     max_shift: float,
-) -> Optional[np.ndarray]:
+) -> Tuple[Optional[np.ndarray], str]:
     """
     Snap a pose-based wrist seed onto the actual glove using HSV back-projection.
 
     Searches a window of the given radius around `seed`, back-projects against the
     fighter's glove colour `model`, thresholds + cleans the probability map, and
     returns the centroid of the glove-coloured blob nearest the seed (area-gated).
-    Returns None when no plausible blob is found or it would move the point more
-    than `max_shift` px — in which case the caller keeps the pose estimate.
+
+    Returns (point, reason).  point is None when no plausible blob is found or it
+    would move the point more than `max_shift` px (caller keeps the pose estimate).
+    `reason` ∈ {ok, roi_small, no_contour, no_blob_area, shift_too_big} for
+    diagnostics.
     """
     fh, fw = frame.shape[:2]
     cx, cy = int(round(seed[0])), int(round(seed[1]))
     x1, y1 = max(0, cx - radius), max(0, cy - radius)
     x2, y2 = min(fw, cx + radius), min(fh, cy + radius)
     if x2 - x1 < 6 or y2 - y1 < 6:
-        return None
+        return None, "roi_small"
 
     roi = frame[y1:y2, x1:x2]
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -1239,7 +1258,7 @@ def _refine_to_glove(
 
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
-        return None
+        return None, "no_contour"
 
     seed_lx, seed_ly = cx - x1, cy - y1
     best_xy, best_d = None, float("inf")
@@ -1255,11 +1274,11 @@ def _refine_to_glove(
             best_d, best_xy = d, (bxx + x1, byy + y1)
 
     if best_xy is None:
-        return None
+        return None, "no_blob_area"
     refined = np.array(best_xy, dtype=np.float64)
     if float(np.linalg.norm(refined - seed)) > max_shift:
-        return None
-    return refined
+        return None, "shift_too_big"
+    return refined, "ok"
 
 
 def _bbox_iou(box1: np.ndarray, box2: np.ndarray) -> float:
