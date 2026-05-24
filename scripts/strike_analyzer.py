@@ -281,12 +281,15 @@ CACHED_SW_MIN_RATIO    = 0.60   # instantaneous sw floored at this × the EMA
 CACHED_SW_MAX_RATIO    = 1.80   # instantaneous sw capped at this × the EMA
 
 # ── Temporal wrist-step constraint ────────────────────────────────────────────
-# A wrist can't teleport between frames.  A YOLO wrist that lands more than this
-# many shoulder-widths from the LAST REAL detection (scaled by frames elapsed
-# since that detection) is a glitch — reject it and let the hand ghost/fallback.
-# 0.60 sw/frame ≈ 16 m/s, comfortably above any real fist; the per-frame scaling
-# lets the fist "catch up" after a few dropped frames.
-MAX_WRIST_STEP_SW      = 0.60
+# A LAST-RESORT teleport guard, NOT a speed limiter.  The forearm-reach and
+# elbow-ownership constraints already bound a real wrist anatomically (a fast
+# punch stays within forearm reach of the elbow), so this only needs to catch
+# gross glitches — mainly in the no-elbow branch where the anatomical bound
+# can't apply.  It was previously set far too tight (0.60 sw ≈ 16 m/s), which
+# rejected real fast punches AND noisy detections during exactly the moments
+# that matter, dumping the dot onto an off-glove fallback ~⅓ of all frames.
+# 1.50 sw/frame ≈ 40 m/s — above any human strike; only egregious teleports fail.
+MAX_WRIST_STEP_SW      = 1.50
 WRIST_STEP_MAX_FRAMES  = 5      # cap the elapsed-frame scaling so a long gap
                                 # doesn't fully disable the step constraint.
 
@@ -648,6 +651,18 @@ class Fighter:
         self.reject_extension:   Dict[str, int] = {"Left": 0, "Right": 0}
         self.reject_direction:   Dict[str, int] = {"Left": 0, "Right": 0}
 
+        # ── Dot-source breakdown (the REAL "is the dot on the glove" metric) ──
+        # Classifies the dot DRAWN each frame the hand is being processed:
+        #   on_glove : real YOLO detection snapped to an actual glove colour blob
+        #   at_wrist : real YOLO detection, NOT snapped (sits at the bare wrist)
+        #   fallback : no usable detection — elbow-projected estimate (off-glove)
+        #   ghost    : Kalman prediction with no measurement at all
+        # "% welded to glove" = on_glove / (on_glove+at_wrist+fallback+ghost).
+        self.dot_on_glove: Dict[str, int] = {"Left": 0, "Right": 0}
+        self.dot_at_wrist: Dict[str, int] = {"Left": 0, "Right": 0}
+        self.dot_fallback: Dict[str, int] = {"Left": 0, "Right": 0}
+        self.dot_ghost:    Dict[str, int] = {"Left": 0, "Right": 0}
+
         self.cached_torso: Optional[np.ndarray] = None
         self.cached_sw:    float                = 150.0
         self.cached_sw_ema: Optional[float]     = None   # slow EMA used to clamp sw
@@ -686,6 +701,17 @@ class Fighter:
             f"  ext={self.reject_extension['Left']}/{self.reject_extension['Right']}"
             f"  dir={self.reject_direction['Left']}/{self.reject_direction['Right']}",
         ]
+        # Dot-source breakdown — the metric that actually reflects "is the dot
+        # on the glove."  Reported per hand as percentages of drawn frames.
+        for side in ("Left", "Right"):
+            g = self.dot_on_glove[side]; w = self.dot_at_wrist[side]
+            f = self.dot_fallback[side]; gh = self.dot_ghost[side]
+            tot = max(1, g + w + f + gh)
+            lines.append(
+                f"    {side:5s} dot:  ON-GLOVE {100*g/tot:4.1f}%  "
+                f"at-wrist {100*w/tot:4.1f}%  fallback {100*f/tot:4.1f}%  "
+                f"ghost {100*gh/tot:4.1f}%   (n={g+w+f+gh})"
+            )
         return "\n".join(lines)
 
 
@@ -772,9 +798,10 @@ def _arm_extension(kps: np.ndarray, conf: np.ndarray, side: str) -> float:
 @dataclass
 class WristMeas:
     """Result of the anatomical wrist estimator for one hand on one frame."""
-    pos:    Optional[np.ndarray] = None   # measurement to feed the KF (None → ghost)
-    conf:   float                = 0.0    # confidence (0–1) → drives KF R
-    source: str                  = "none" # "yolo" | "kinematic" | "none"
+    pos:     Optional[np.ndarray] = None  # measurement to feed the KF (None → ghost)
+    conf:    float                = 0.0   # confidence (0–1) → drives KF R
+    source:  str                  = "none" # "yolo" | "kinematic" | "none"
+    refined: bool                 = False  # True → snapped to an actual glove blob
 
 
 def _wrist_step_ok(state: "HandState", cand: np.ndarray, sw: float) -> bool:
@@ -852,10 +879,13 @@ def _estimate_wrist_measurements(
     model_ready = (fighter.glove_color_model is not None
                    and fighter.glove_model_sat >= GLOVE_MODEL_MIN_SAT)
 
-    def _finalize_pos(side: str, w: np.ndarray) -> np.ndarray:
-        """Build the colour model from confident frames, then snap to the glove."""
+    def _finalize_pos(side: str, w: np.ndarray) -> Tuple[np.ndarray, bool]:
+        """
+        Build the colour model from confident frames, then snap to the glove.
+        Returns (position, snapped_to_glove).
+        """
         if frame is None:
-            return w
+            return w, False
         if fighter.glove_color_model is None:
             samp = _glove_color_sample(frame, w, sample_r)
             if samp is not None:
@@ -868,14 +898,14 @@ def _estimate_wrist_measurements(
                     fighter.glove_model_sat   = float(
                         np.mean([s for _, s in fighter.glove_model_accum]))
                     fighter.glove_model_accum = []
-            return w
+            return w, False
         if model_ready:
             refined = _refine_to_glove(frame, w, fighter.glove_color_model,
                                        refine_r, min_blob, max_shift)
             if refined is not None:
                 fighter.glove_refined[side] += 1
-                return refined
-        return w
+                return refined, True
+        return w, False
 
     for s in sides:
         state     = fighter.hands[s]
@@ -908,8 +938,8 @@ def _estimate_wrist_measurements(
                     # frame); the OUTPUT is snapped to the glove face.
                     state.last_yolo_pos     = w.copy()
                     state.frames_since_yolo = 0
-                    pos = _finalize_pos(s, w)
-                    out[s] = WristMeas(pos, wrist_conf[s], "yolo")
+                    pos, snapped = _finalize_pos(s, w)
+                    out[s] = WristMeas(pos, wrist_conf[s], "yolo", refined=snapped)
                     accepted = True
             else:
                 fighter.reject_forearm[s] += 1
@@ -920,8 +950,9 @@ def _estimate_wrist_measurements(
             if _wrist_step_ok(state, w, sw):
                 state.last_yolo_pos     = w.copy()
                 state.frames_since_yolo = 0
-                pos = _finalize_pos(s, w)
-                out[s] = WristMeas(pos, wrist_conf[s] * NO_ELBOW_CONF_SCALE, "yolo")
+                pos, snapped = _finalize_pos(s, w)
+                out[s] = WristMeas(pos, wrist_conf[s] * NO_ELBOW_CONF_SCALE,
+                                   "yolo", refined=snapped)
                 accepted = True
             else:
                 fighter.reject_step[s] += 1
@@ -2022,6 +2053,18 @@ def analyze_video(
 
                 state.wrist_pos = wrist_pos
                 state.is_ghost  = is_ghost
+
+                # ── Dot-source classification (the real on-glove metric) ──────
+                if wrist_pos is not None:
+                    if is_ghost:
+                        fighter.dot_ghost[side] += 1
+                    elif meas.source == "kinematic":
+                        fighter.dot_fallback[side] += 1
+                    elif meas.source == "yolo":
+                        if meas.refined:
+                            fighter.dot_on_glove[side] += 1
+                        else:
+                            fighter.dot_at_wrist[side] += 1
 
                 if wrist_pos is None:
                     state.prev_pos = None
