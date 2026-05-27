@@ -1,0 +1,16 @@
+# ── combat_analytics_v1 — core dependencies ────────────────────────────────
+# Target: Python 3.11+ (arm64 on Apple Silicon).  The legacy dev box runs 3.9;
+# new work standardizes on 3.11 so the pose pipeline and the EdgeTAM tracking
+# core can share one environment.
+ultralytics==8.4.48
+opencv-python==4.12.0.88
+numpy==2.0.2
+pandas==2.3.3
+torch==2.8.0
+torchvision==0.23.0
+
+# ── Tracking core (installed separately) ───────────────────────────────────
+# EdgeTAM (lightweight SAM2-family mask tracker) is NOT pip-installable from
+# PyPI — it needs its own repo clone + bundled checkpoint + the `timm` backbone,
+# plus a one-line torch-compat patch.  Use the turnkey installer instead:
+#     bash scripts/setup_edgetam_mac.sh
