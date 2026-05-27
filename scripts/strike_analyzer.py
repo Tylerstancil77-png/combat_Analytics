@@ -94,7 +94,12 @@ SKELETON_EDGES = [
 # ══════════════════════════════════════════════════════════════════════════════
 # Tuning constants
 # ══════════════════════════════════════════════════════════════════════════════
-DEFAULT_MODEL        = "yolo11n-pose.pt"
+DEFAULT_MODEL        = "yolo11n-pose.pt"    # Phase-1 A/B verdict: a 4×-larger
+                                            # model gave ~0 dot-on-glove gain
+                                            # (69.4%→69.9%) for 4× runtime — the
+                                            # bottleneck is structural, not the
+                                            # detector. Keep nano as a fast seed
+                                            # for the Phase-2 temporal tracker.
 YOLO_CONF            = 0.40
 YOLO_IOU             = 0.45
 YOLO_IMGSZ           = 640    # inference resolution.  Tried 1280 — it INCREASED
@@ -669,6 +674,13 @@ class Fighter:
         self.dot_at_wrist: Dict[str, int] = {"Left": 0, "Right": 0}
         self.dot_fallback: Dict[str, int] = {"Left": 0, "Right": 0}
         self.dot_ghost:    Dict[str, int] = {"Left": 0, "Right": 0}
+        # Flyaway split into two unambiguous buckets:
+        #   offframe : drawn dot is literally outside the video frame (the
+        #              "flying off SCREEN" symptom)
+        #   farbody  : on-screen but >3.5 shoulder-widths from the torso centre
+        #              (off the body but still visible)
+        self.dot_offframe: Dict[str, int] = {"Left": 0, "Right": 0}
+        self.dot_farbody:  Dict[str, int] = {"Left": 0, "Right": 0}
         # Why glove refinement failed when it did (diagnostic for at-wrist dots).
         self.refine_reason: Dict[str, Dict[str, int]] = {"Left": {}, "Right": {}}
 
@@ -716,10 +728,12 @@ class Fighter:
             g = self.dot_on_glove[side]; w = self.dot_at_wrist[side]
             f = self.dot_fallback[side]; gh = self.dot_ghost[side]
             tot = max(1, g + w + f + gh)
+            off = self.dot_offframe[side]; far = self.dot_farbody[side]
             lines.append(
                 f"    {side:5s} dot:  ON-GLOVE {100*g/tot:4.1f}%  "
                 f"at-wrist {100*w/tot:4.1f}%  fallback {100*f/tot:4.1f}%  "
-                f"ghost {100*gh/tot:4.1f}%   (n={g+w+f+gh})"
+                f"ghost {100*gh/tot:4.1f}%   (n={g+w+f+gh})   "
+                f"OFF-SCREEN={off} ({100*off/tot:.1f}%)  far-body={far} ({100*far/tot:.1f}%)"
             )
         for side in ("Left", "Right"):
             rr = self.refine_reason[side]
@@ -816,6 +830,37 @@ class WristMeas:
     conf:    float                = 0.0   # confidence (0–1) → drives KF R
     source:  str                  = "none" # "yolo" | "kinematic" | "none"
     refined: bool                 = False  # True → snapped to an actual glove blob
+
+
+def _clamp_prediction(
+    p:      Optional[np.ndarray],
+    bbox:   Optional[np.ndarray],
+    w:      int,
+    h:      int,
+    margin: float = 0.6,
+) -> Optional[np.ndarray]:
+    """
+    Cage a PREDICTED dot (Kalman ghost / kinematic fallback) to a plausible
+    region so it can never fly off-screen or far off the body.  Real YOLO
+    detections are NOT clamped — only predictions, which is where the flying
+    came from (unbounded velocity extrapolation during track loss).
+
+    The region is the fighter's last bounding box expanded by `margin` of its
+    size (generous, so a legitimately extended punch isn't clipped), then
+    intersected with the frame bounds.  Returns the clamped point.
+    """
+    if p is None:
+        return None
+    x, y = float(p[0]), float(p[1])
+    if bbox is not None:
+        bx1, by1, bx2, by2 = (float(bbox[0]), float(bbox[1]),
+                               float(bbox[2]), float(bbox[3]))
+        mw, mh = (bx2 - bx1) * margin, (by2 - by1) * margin
+        x = min(max(x, bx1 - mw), bx2 + mw)
+        y = min(max(y, by1 - mh), by2 + mh)
+    x = min(max(x, 0.0), w - 1.0)
+    y = min(max(y, 0.0), h - 1.0)
+    return np.array([x, y])
 
 
 def _wrist_step_ok(state: "HandState", cand: np.ndarray, sw: float) -> bool:
@@ -1477,6 +1522,7 @@ def analyze_video(
     model_path:       str  = DEFAULT_MODEL,
     save_annotated:   bool = True,
     show_preview:     bool = False,
+    max_frames:       Optional[int] = None,   # stop after N frames (for quick A/B tests)
 ) -> str:
 
     cap = cv2.VideoCapture(video_path)
@@ -1579,6 +1625,9 @@ def analyze_video(
      while True:
         ret, frame = cap.read()
         if not ret:
+            break
+        if max_frames is not None and frame_idx >= max_frames:
+            print(f"[strike_analyzer] Reached max_frames={max_frames} — stopping early.")
             break
 
         timestamp = frame_idx / fps
@@ -1954,13 +2003,29 @@ def analyze_video(
             # The KF ghost-predicts a position even with no real detection.
             # Capture it so the wrist overlay keeps gliding instead of freezing
             # at the last real frame — much easier to tell where the fighter is.
+            def _tally_flyaway(p: Optional[np.ndarray], side: str) -> None:
+                if p is None:
+                    return
+                if not (0 <= p[0] < width and 0 <= p[1] < height):
+                    fighter.dot_offframe[side] += 1
+                elif (fighter.cached_torso is not None and
+                      float(np.linalg.norm(p - fighter.cached_torso))
+                      > 3.5 * fighter.cached_sw):
+                    fighter.dot_farbody[side] += 1
+
             track_lost = fighters_locked and det_idx is None
             if track_lost:
+                _cb = fighter.cached_bbox
                 for side, state in fighter.hands.items():
                     wrist_pos, is_ghost = state.kf.update(None)
-                    state.wrist_pos = wrist_pos   # keep dot moving
+                    # Ghost predictions are unbounded velocity extrapolations —
+                    # cage them so they can't fly off-screen / off-body.
+                    wrist_pos = _clamp_prediction(wrist_pos, _cb, width, height)
+                    state.wrist_pos = wrist_pos   # keep dot moving (but caged)
                     state.is_ghost  = is_ghost
+                    _tally_flyaway(wrist_pos, side)
                 head_pos, is_ghost_h = fighter.head.kf.update(None)
+                head_pos = _clamp_prediction(head_pos, _cb, width, height)
                 fighter.head.head_pos = head_pos
                 fighter.head.is_ghost = is_ghost_h
                 if save_annotated or show_preview:
@@ -2070,6 +2135,12 @@ def analyze_video(
 
                 wrist_pos, is_ghost = state.kf.update(filtered_pos, kp_conf=kp_conf)
 
+                # Cage PREDICTED dots (ghost or kinematic fallback) to the
+                # current bbox + frame.  A real, glove-snapped/at-wrist detection
+                # is left exactly where it was observed.
+                if wrist_pos is not None and (is_ghost or meas.source != "yolo"):
+                    wrist_pos = _clamp_prediction(wrist_pos, bbox, width, height)
+
                 state.wrist_pos = wrist_pos
                 state.is_ghost  = is_ghost
 
@@ -2084,6 +2155,7 @@ def analyze_video(
                             fighter.dot_on_glove[side] += 1
                         else:
                             fighter.dot_at_wrist[side] += 1
+                    _tally_flyaway(wrist_pos, side)
 
                 if wrist_pos is None:
                     state.prev_pos = None
@@ -2303,10 +2375,16 @@ if __name__ == "__main__":
         video_path = found[int(choice) - 1]
         print(f"\n[strike_analyzer] Using: {video_path}")
 
+    # Env overrides for quick A/B experiments:
+    #   SA_MODEL=yolo11n-pose.pt   — override the pose model
+    #   SA_MAX_FRAMES=3600         — stop after N frames
+    _model = os.environ.get("SA_MODEL", DEFAULT_MODEL)
+    _maxf  = os.environ.get("SA_MAX_FRAMES")
     analyze_video(
         video_path,
         output_dir     = "output_data",
-        model_path     = DEFAULT_MODEL,
+        model_path     = _model,
         save_annotated = True,
         show_preview   = False,
+        max_frames     = int(_maxf) if _maxf else None,
     )
